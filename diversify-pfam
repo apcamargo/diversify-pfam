@@ -1,0 +1,319 @@
+#!/usr/bin/env python
+
+import gzip
+import logging
+import os
+import shutil
+import sys
+from pathlib import Path
+
+import click
+import requests
+import sh
+
+CONTEXT_SETTINGS = dict(help_option_names=["-h", "--help"])
+SCRIPTS_DIR = Path(__file__).resolve().parent / "scripts"
+CLUSTER_MSA = sh.Command(SCRIPTS_DIR / "cluster_msa" / "cluster_msa.py")
+CONVERT_MSA = sh.Command(SCRIPTS_DIR / "convert_msa.py")
+ESL_ALIMASK = sh.Command("esl-alimask")
+GENERATE_HMMS = sh.Command(SCRIPTS_DIR / "generate_hmms.py")
+HHBLITS = sh.Command("hhblits")
+HHFILTER = sh.Command("hhfilter")
+REFORMAT_PL = sh.Command("reformat.pl")
+SEQKIT = sh.Command("seqkit")
+
+
+def download_alignment(acc, alignment_type, output_file):
+    url = f"https://www.ebi.ac.uk/interpro/wwwapi//entry/pfam/{acc}?annotation=alignment:{alignment_type}"
+    response = requests.get(url, stream=True)
+    response.raise_for_status()
+    with gzip.GzipFile(fileobj=response.raw) as f_in:
+        with open(output_file, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
+
+
+def run_reduce_msa_redundancy(input_file, output_file, maximum_identity):
+    hhfilter_cmd = HHFILTER(
+        "-M",
+        "50",
+        "-cov",
+        "75",
+        "-id",
+        str(maximum_identity),
+        "-i",
+        input_file,
+        "-o",
+        "/dev/stdout",
+        _err="/dev/null",
+    )
+    reformat_cmd = REFORMAT_PL(
+        "-v",
+        "0",
+        "a3m",
+        "fas",
+        "/dev/stdin",
+        "/dev/stdout",
+        _err="/dev/null",
+        _in=hhfilter_cmd,
+    )
+    esl_alimask_cmd = ESL_ALIMASK(
+        "-g",
+        "--gapthresh",
+        "0.5",
+        "--amino",
+        "--outformat",
+        "afa",
+        "-",
+        _in=reformat_cmd,
+        _err="/dev/null",
+    )
+    with open(output_file, "w") as fo:
+        SEQKIT("seq", "-u", _in=esl_alimask_cmd, _out=fo)
+
+
+def run_hhblits_enrichment(input_file, output_file, db):
+    databases = [item for db in db for item in ["-d", db]]
+    hhblits_cmd = HHBLITS(
+        "-i",
+        f"{input_file}",
+        "-o",
+        "/dev/null",
+        "-oa3m",
+        "/dev/stdout",
+        *databases,
+        "-M",
+        "50",
+        "-id",
+        "90",
+        "-cov",
+        "75",
+        "-p",
+        "90",
+        "-n",
+        "3",
+        "-cpu",
+        "64",
+        "-e",
+        "1e-6",
+        "-v",
+        "0",
+    )
+    reformat_cmd = REFORMAT_PL(
+        "-v",
+        "0",
+        "a3m",
+        "fas",
+        "/dev/stdin",
+        "/dev/stdout",
+        _in=hhblits_cmd,
+        _err="/dev/null",
+    )
+    esl_alimask_cmd = ESL_ALIMASK(
+        "-g",
+        "--gapthresh",
+        "0.5",
+        "--amino",
+        "--outformat",
+        "afa",
+        "-",
+        _in=reformat_cmd,
+        _err="/dev/null",
+    )
+    with open(output_file, "w") as fo:
+        SEQKIT("seq", "-u", _in=esl_alimask_cmd, _out=fo)
+
+
+def run_cluster_msa(input_file, output_dir, prefix):
+    CLUSTER_MSA("--max-gap-column", "0.5", input_file, output_dir, prefix)
+
+
+def run_generate_hmms(output_hmm_file, output_dir, pfam, gathering_cutoff, ascii_hmm):
+    input_msa_files = [str(p) for p in output_dir.glob(f"{pfam}*.afa")]
+    additional_args = []
+    if gathering_cutoff:
+        additional_args += ["--set-ga", str(gathering_cutoff)]
+    if ascii_hmm:
+        additional_args += ["--ascii-hmm"]
+    GENERATE_HMMS(
+        output_hmm_file,
+        *sorted(input_msa_files),
+        *additional_args,
+    )
+
+
+@click.command(context_settings=CONTEXT_SETTINGS)
+@click.argument("pfam", type=str)
+@click.argument("output_dir", type=click.Path(path_type=Path))
+@click.argument("output_hmm_file", type=click.Path(path_type=Path))
+@click.option(
+    "-m", "--msa-file", is_flag=True, help="Input is a multiple sequence alignment FASTA file"
+)
+@click.option("-d", "--database", multiple=True, help="HHblits database(s)")
+@click.option(
+    "--disable-enrichment", is_flag=True, help="Disable MSA enrichment with HHblits"
+)
+@click.option(
+    "--disable-clustering", type=float, help="Disable MSA clustering into subalignments"
+)
+@click.option(
+    "--ascii-hmm", is_flag=True, help="Output ASCII HMM instead of the binary format."
+)
+@click.option(
+    "--gathering-cutoff",
+    type=float,
+    help="Set the gathering cutoff value for the resulting HMMs",
+)
+@click.option("--verbose", is_flag=True, help="Enable verbose mode")
+def diversify_pfam(
+    pfam,
+    output_dir,
+    output_hmm_file,
+    msa_file,
+    database,
+    disable_enrichment,
+    disable_clustering,
+    ascii_hmm,
+    gathering_cutoff,
+    verbose,
+):
+    logging.basicConfig(
+        level=logging.INFO if verbose else logging.NOTSET,
+        format="[%(asctime)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    logging.getLogger("sh").setLevel(logging.WARNING)
+
+    if msa_file and not Path(pfam).exists():
+        logging.error(f"The input MSA file '{pfam}' does not exist.")
+        sys.exit(1)
+    elif msa_file:
+        input_file = Path(pfam)
+        pfam = input_file.stem
+    else:
+        input_file = None
+
+    if not disable_enrichment and not database:
+        logging.error("Use --disable-enrichment or provide HHblits database(s)")
+        sys.exit(1)
+
+    # If output directory does not exist, create it
+    if not os.path.isdir(output_dir):
+        logging.info(f"Creating output directory '{output_dir}'…")
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    if not msa_file:
+        # Download the seed and full alignments
+        logging.info(f"Downloading '{pfam}' seed and full alignments…")
+        download_alignment(pfam, "seed", output_dir / f"{pfam}_seed.sto")
+        download_alignment(pfam, "full", output_dir / f"{pfam}_full.sto")
+
+        # Convert the seed and full alignments to the FASTA format and remove
+        # unaligned columns
+        logging.info(
+            "Converting seed and full alignments to the FASTA format and removing "
+            "unaligned columns…"
+        )
+        CONVERT_MSA(
+            str(output_dir / f"{pfam}_seed.sto"),
+            str(output_dir / f"{pfam}_seed.afa"),
+            "stockholm",
+            "fasta",
+            "--remove-lowercase-columns",
+        )
+        CONVERT_MSA(
+            str(output_dir / f"{pfam}_full.sto"),
+            str(output_dir / f"{pfam}_full.afa"),
+            "stockholm",
+            "fasta",
+            "--remove-lowercase-columns",
+        )
+        (output_dir / Path(f"{pfam}_seed.sto")).unlink()
+        (output_dir / Path(f"{pfam}_full.sto")).unlink()
+
+        # Remove redundancy of the full/input MSA at 90% and 50% sequence identity
+        logging.info(
+            "Removing redundancy of the full MSA at 90% and 50% sequence identity…"
+        )
+        run_reduce_msa_redundancy(
+            f"{output_dir}/{pfam}_full.afa",
+            f"{output_dir}/{pfam}_90.afa",
+            90,
+        )
+        run_reduce_msa_redundancy(
+            f"{output_dir}/{pfam}_full.afa",
+            f"{output_dir}/{pfam}_50.afa",
+            50,
+        )
+
+    else:
+        # Remove the unaligned columns from the input MSA
+        logging.info("Removing unaligned columns of the input MSA…")
+        CONVERT_MSA(
+            input_file,
+            str(output_dir / f"{pfam}.afa"),
+            "fasta",
+            "fasta",
+            "--remove-lowercase-columns",
+        )
+
+    # Perform HHblits enrichment
+    if not disable_enrichment:
+        logging.info("Performing HHblits enrichment…")
+        if not msa_file:
+            run_hhblits_enrichment(
+                output_dir / f"{pfam}_seed.afa",
+                output_dir / f"{pfam}_enriched.afa",
+                database,
+            )
+        else:
+            run_hhblits_enrichment(
+                input_file,
+                output_dir / f"{pfam}_enriched.afa",
+                database,
+            )
+
+    # Generate clustered alignments
+    if not disable_clustering:
+        if not msa_file:
+            logging.info("Generating clustered alignments for the full MSA…")
+            run_cluster_msa(
+                output_dir / f"{pfam}_full.afa",
+                output_dir,
+                f"{pfam}_full",
+            )
+            logging.info(
+                "Generating clustered alignments for the 50% non-redundant MSA…"
+            )
+            run_cluster_msa(output_dir / f"{pfam}_50.afa", output_dir, f"{pfam}_50")
+            logging.info(
+                "Generating clustered alignments for the 90% non-redundant MSA…"
+            )
+            run_cluster_msa(output_dir / f"{pfam}_90.afa", output_dir, f"{pfam}_90")
+            if not disable_enrichment:
+                logging.info("Generating clustered alignments for HHblits-enriched MSA…")
+                run_cluster_msa(
+                    output_dir / f"{pfam}_enriched.afa",
+                    output_dir,
+                    f"{pfam}_enriched",
+                )
+        else:
+            logging.info("Generating clustered alignments for the input MSA…")
+            run_cluster_msa(
+                output_dir / f"{pfam}.afa",
+                output_dir,
+                f"{pfam}",
+            )
+
+    # Generate HMMs
+    logging.info(f"Generating HMMs and writing to '{output_hmm_file}'…")
+    run_generate_hmms(
+        output_hmm_file,
+        output_dir,
+        pfam,
+        gathering_cutoff,
+        ascii_hmm,
+    )
+
+
+if __name__ == "__main__":
+    diversify_pfam()

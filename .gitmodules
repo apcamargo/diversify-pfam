@@ -1,0 +1,3 @@
+[submodule "scripts/cluster_msa"]
+	path = scripts/cluster_msa
+	url = https://github.com/apcamargo/cluster_msa
